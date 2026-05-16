@@ -1,0 +1,221 @@
+name: Mirror esp-idf Releases (strip .git)
+
+on:
+  schedule:
+    # Check for new releases every hour
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      backfill_all:
+        description: 'Backfill ALL existing releases (true) or only new ones (false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1. Discover which upstream releases need to be mirrored
+  # ─────────────────────────────────────────────────────────────
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Fetch all upstream releases
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Paginate through every release in espressif/esp-idf
+          PAGE=1
+          ALL_TAGS="[]"
+          while true; do
+            CHUNK=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/espressif/esp-idf/releases?per_page=100&page=${PAGE}" \
+              --jq '[.[].tag_name]')
+            COUNT=$(echo "$CHUNK" | jq 'length')
+            ALL_TAGS=$(jq -n --argjson a "$ALL_TAGS" --argjson b "$CHUNK" '$a + $b')
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+          echo "upstream_tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$ALL_TAGS"          >> "$GITHUB_OUTPUT"
+          echo "EOF"                >> "$GITHUB_OUTPUT"
+
+      - name: Fetch already-mirrored releases in this repo
+        id: mirrored
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PAGE=1
+          MIRRORED="[]"
+          while true; do
+            CHUNK=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${{ github.repository }}/releases?per_page=100&page=${PAGE}" \
+              --jq '[.[].tag_name]' 2>/dev/null || echo "[]")
+            COUNT=$(echo "$CHUNK" | jq 'length')
+            MIRRORED=$(jq -n --argjson a "$MIRRORED" --argjson b "$CHUNK" '$a + $b')
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+          echo "mirrored_tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$MIRRORED"          >> "$GITHUB_OUTPUT"
+          echo "EOF"                >> "$GITHUB_OUTPUT"
+
+      - name: Build job matrix
+        id: build-matrix
+        env:
+          BACKFILL: ${{ github.event.inputs.backfill_all }}
+        run: |
+          UPSTREAM='${{ steps.upstream.outputs.upstream_tags }}'
+          MIRRORED='${{ steps.mirrored.outputs.mirrored_tags }}'
+
+          if [ "$BACKFILL" = "true" ]; then
+            # Re-process every upstream release
+            PENDING="$UPSTREAM"
+          else
+            # Only releases not yet mirrored
+            PENDING=$(jq -n \
+              --argjson u "$UPSTREAM" \
+              --argjson m "$MIRRORED" \
+              '[$u[] | select(. as $t | $m | index($t) | not)]')
+          fi
+
+          COUNT=$(echo "$PENDING" | jq 'length')
+          echo "Releases to mirror: $COUNT"
+
+          # GitHub matrix max = 256 entries; slice if needed
+          MATRIX=$(jq -n --argjson p "$PENDING" \
+            '{include: [$p[:256][] | {tag: .}]}')
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. For each release: download source, strip .git, republish
+  # ─────────────────────────────────────────────────────────────
+  mirror:
+    needs: discover
+    # Skip entirely when there is nothing to do
+    if: ${{ fromJson(needs.discover.outputs.matrix).include[0] != null }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4          # be polite to GitHub's servers
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get install -y jq
+
+      - name: Fetch upstream release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          DATA=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/espressif/esp-idf/releases/tags/${TAG}")
+
+          # Preserve release name and body for republishing
+          echo "release_name=$(echo "$DATA" | jq -r '.name // empty')" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(echo "$DATA"   | jq -r '.prerelease')"     >> "$GITHUB_OUTPUT"
+          echo "draft=$(echo "$DATA"        | jq -r '.draft')"          >> "$GITHUB_OUTPUT"
+
+          # Save full body to a file to avoid shell quoting issues
+          echo "$DATA" | jq -r '.body // ""' > /tmp/release_body.md
+
+      # ── Download & strip ──────────────────────────────────────
+      - name: Download upstream tarball and strip .git
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          ARCHIVE_NAME="esp-idf-${TAG}"
+          TARBALL_URL="https://github.com/espressif/esp-idf/archive/refs/tags/${TAG}.tar.gz"
+          ZIPBALL_URL="https://github.com/espressif/esp-idf/archive/refs/tags/${TAG}.zip"
+
+          mkdir -p /tmp/work
+          cd /tmp/work
+
+          echo "==> Downloading tarball…"
+          curl -fL "$TARBALL_URL" -o upstream.tar.gz
+
+          echo "==> Extracting…"
+          tar xzf upstream.tar.gz
+
+          # The extracted directory is typically esp-idf-<TAG>
+          EXTRACTED_DIR=$(tar tzf upstream.tar.gz | head -1 | cut -d/ -f1)
+
+          echo "==> Removing .git artifacts…"
+          find "${EXTRACTED_DIR}" -name ".git"         -type d -exec rm -rf {} + 2>/dev/null || true
+          find "${EXTRACTED_DIR}" -name ".gitmodules"  -type f -delete 2>/dev/null || true
+          find "${EXTRACTED_DIR}" -name ".gitignore"   -type f -delete 2>/dev/null || true
+          find "${EXTRACTED_DIR}" -name ".gitattributes" -type f -delete 2>/dev/null || true
+
+          echo "==> Repacking as tar.gz…"
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${EXTRACTED_DIR}"
+
+          echo "==> Repacking as zip…"
+          zip -qr "${ARCHIVE_NAME}.zip" "${EXTRACTED_DIR}"
+
+          echo "==> Sizes:"
+          ls -lh "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}.zip"
+
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+          echo "WORK_DIR=/tmp/work"           >> "$GITHUB_ENV"
+
+      # ── Create / overwrite the release in this repo ───────────
+      - name: Create or update mirrored release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.tag }}
+          RELEASE_NAME: ${{ steps.meta.outputs.release_name }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          DRAFT: ${{ steps.meta.outputs.draft }}
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+
+          # Build a note prepended to the original body
+          HEADER="**Mirrored from [espressif/esp-idf@${TAG}](https://github.com/espressif/esp-idf/releases/tag/${TAG}).**
+          > ⚠️ \`.git\` directory and all Git metadata have been removed from the source archives.
+
+          ---
+          "
+          printf '%s\n' "$HEADER" | cat - /tmp/release_body.md > /tmp/full_body.md
+
+          # Delete existing mirrored release+tag if present (idempotent re-run)
+          gh release delete "$TAG" \
+            --repo "${{ github.repository }}" \
+            --yes 2>/dev/null || true
+
+          git init /tmp/dummy-repo
+          cd /tmp/dummy-repo
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          # Create the tag ref in this repo pointing at HEAD of the default branch
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/git/refs" \
+            -f "ref=refs/tags/${TAG}" \
+            -f "sha=$(gh api /repos/${{ github.repository }}/git/ref/heads/$(gh api /repos/${{ github.repository }} --jq '.default_branch') --jq '.object.sha')" \
+            2>/dev/null || true   # ignore "already exists" errors
+
+          cd "$WORK_DIR"
+
+          # Create the release
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "${RELEASE_NAME:-$TAG} (no .git)" \
+            --notes-file /tmp/full_body.md \
+            $( [ "$PRERELEASE" = "true" ] && echo "--prerelease" ) \
+            "${ARCHIVE_NAME}.tar.gz" \
+            "${ARCHIVE_NAME}.zip"
+
+          echo "✅ Release $TAG mirrored successfully."
