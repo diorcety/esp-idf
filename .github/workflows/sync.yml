@@ -22,12 +22,14 @@ jobs:
       - name: Sync all branches and tags from upstream
         run: |
           git remote add upstream https://github.com/espressif/esp-idf.git
-          git fetch upstream --tags --force
 
-          # Push all upstream branches (force to overwrite diverged refs)
-          git push origin refs/remotes/upstream/*:refs/heads/* --force
+          # Fetch everything from upstream
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' '+refs/tags/*:refs/tags/*' --force
+
+          # Push all branches
+          git push origin '+refs/remotes/upstream/*:refs/heads/*' --force
 
           # Push all tags
-          git push origin --tags --force
+          git push origin '+refs/tags/*:refs/tags/*' --force
 
           echo "✅ Sync complete"
