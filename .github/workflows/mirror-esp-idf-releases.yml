@@ -177,13 +177,16 @@ jobs:
           find "${EXTRACTED_DIR}" -name ".gitignore"     -type f -delete 2>/dev/null || true
           find "${EXTRACTED_DIR}" -name ".gitattributes" -type f -delete 2>/dev/null || true
 
-          echo "==> Repacking as zip…"
-          zip -qr "${ASSET_NAME}" "${EXTRACTED_DIR}"
+          # Repack as .tar.xz — same base name as the original zip, just different extension
+          XZ_NAME="${ASSET_NAME%.zip}.tar.xz"
+
+          echo "==> Repacking as tar.xz…"
+          tar cJf "${XZ_NAME}" "${EXTRACTED_DIR}"
 
           echo "==> Size:"
-          ls -lh "${ASSET_NAME}"
+          ls -lh "${XZ_NAME}"
 
-          echo "ASSET_NAME=${ASSET_NAME}" >> "$GITHUB_ENV"
+          echo "XZ_NAME=${XZ_NAME}" >> "$GITHUB_ENV"
           echo "WORK_DIR=$GITHUB_WORKSPACE/work" >> "$GITHUB_ENV"
 
       - name: Publish mirrored release
@@ -196,6 +199,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
+          XZ_NAME="${ASSET_NAME%.zip}.tar.xz"
 
           printf '> Mirrored from [espressif/esp-idf@%s](https://github.com/espressif/esp-idf/releases/tag/%s). `.git` directory removed.\n\n---\n\n' \
             "$TAG" "$TAG" | cat - "$GITHUB_WORKSPACE/release_body.md" > "$GITHUB_WORKSPACE/full_body.md"
@@ -224,7 +228,6 @@ jobs:
             --title "${RELEASE_NAME:-$TAG}" \
             --notes-file "$GITHUB_WORKSPACE/full_body.md" \
             $PRERELEASE_FLAG \
-            "${ASSET_NAME}"
+            "${XZ_NAME}"
 
           echo "✅ Mirrored $TAG"
-
