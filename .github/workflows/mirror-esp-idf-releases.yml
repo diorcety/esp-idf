@@ -137,29 +137,39 @@ jobs:
           echo "release_name=$(echo "$DATA" | jq -r '.name // empty')" >> "$GITHUB_OUTPUT"
           echo "prerelease=$(echo "$DATA"   | jq -r '.prerelease')"     >> "$GITHUB_OUTPUT"
 
+          # Find the .zip release asset (the one espressif uploads, e.g. esp-idf-v6.0.1.zip)
+          ASSET_URL=$(echo "$DATA" | jq -r '[.assets[] | select(.name | endswith(".zip"))][0].browser_download_url')
+          ASSET_NAME=$(echo "$DATA" | jq -r '[.assets[] | select(.name | endswith(".zip"))][0].name')
+          if [ "$ASSET_URL" = "null" ] || [ -z "$ASSET_URL" ]; then
+            echo "ERROR: No .zip asset found for ${TAG}" >&2
+            exit 1
+          fi
+          echo "Asset: $ASSET_NAME -> $ASSET_URL"
+          echo "asset_url=${ASSET_URL}"   >> "$GITHUB_OUTPUT"
+          echo "asset_name=${ASSET_NAME}" >> "$GITHUB_OUTPUT"
+
           echo "$DATA" | jq -r '.body // ""' > "$GITHUB_WORKSPACE/release_body.md"
 
-      - name: Download tarball, strip .git, repack
+      - name: Download release zip, strip .git, repack
         env:
           TAG: ${{ matrix.tag }}
+          ASSET_URL: ${{ steps.meta.outputs.asset_url }}
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
         run: |
           set -euo pipefail
-
-          # Use the exact same archive name GitHub generates so download URLs
-          # are identical to upstream, only the repo prefix changes.
-          BASENAME="esp-idf-${TAG}"
-          TARBALL_URL="https://github.com/espressif/esp-idf/archive/refs/tags/${TAG}.tar.gz"
 
           mkdir -p "$GITHUB_WORKSPACE/work"
           cd "$GITHUB_WORKSPACE/work"
 
-          echo "==> Downloading ${TAG}…"
-          curl -fL "$TARBALL_URL" -o upstream.tar.gz
+          echo "==> Downloading ${ASSET_NAME}…"
+          curl -fL "$ASSET_URL" -o upstream.zip
 
           echo "==> Extracting…"
-          tar xzf upstream.tar.gz
-          EXTRACTED_DIR=$(tar tzf upstream.tar.gz | head -1 | cut -d/ -f1)
+          EXTRACTED_DIR=$(unzip -Z1 upstream.zip | head -1 | cut -d/ -f1)
           echo "Extracted dir: $EXTRACTED_DIR"
+          unzip -q upstream.zip
+          # Remove the original zip immediately to free space before repacking
+          rm upstream.zip
 
           echo "==> Stripping .git artifacts…"
           find "${EXTRACTED_DIR}" -name ".git"           -type d -exec rm -rf {} + 2>/dev/null || true
@@ -167,17 +177,14 @@ jobs:
           find "${EXTRACTED_DIR}" -name ".gitignore"     -type f -delete 2>/dev/null || true
           find "${EXTRACTED_DIR}" -name ".gitattributes" -type f -delete 2>/dev/null || true
 
-          echo "==> Repacking as tar.gz…"
-          tar czf "${BASENAME}.tar.gz" "${EXTRACTED_DIR}"
-
           echo "==> Repacking as zip…"
-          zip -qr "${BASENAME}.zip" "${EXTRACTED_DIR}"
+          zip -qr "${ASSET_NAME}" "${EXTRACTED_DIR}"
 
-          echo "==> Sizes:"
-          ls -lh "${BASENAME}.tar.gz" "${BASENAME}.zip"
+          echo "==> Size:"
+          ls -lh "${ASSET_NAME}"
 
-          echo "BASENAME=${BASENAME}" >> "$GITHUB_ENV"
-          echo "WORK_DIR=$GITHUB_WORKSPACE/work"   >> "$GITHUB_ENV"
+          echo "ASSET_NAME=${ASSET_NAME}" >> "$GITHUB_ENV"
+          echo "WORK_DIR=$GITHUB_WORKSPACE/work" >> "$GITHUB_ENV"
 
       - name: Publish mirrored release
         env:
@@ -185,6 +192,7 @@ jobs:
           TAG: ${{ matrix.tag }}
           RELEASE_NAME: ${{ steps.meta.outputs.release_name }}
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
@@ -216,7 +224,7 @@ jobs:
             --title "${RELEASE_NAME:-$TAG}" \
             --notes-file "$GITHUB_WORKSPACE/full_body.md" \
             $PRERELEASE_FLAG \
-            "${BASENAME}.tar.gz" \
-            "${BASENAME}.zip"
+            "${ASSET_NAME}"
 
           echo "✅ Mirrored $TAG"
+
