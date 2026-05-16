@@ -2,8 +2,8 @@ name: Mirror esp-idf Releases (strip .git)
 
 on:
   schedule:
-    # Check for new releases every hour
-    - cron: '0 * * * *'
+    # Check for new releases every day
+    - cron: '20 4 * * *'
   workflow_dispatch:
     inputs:
       release_count:
