@@ -118,6 +118,9 @@ jobs:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install dependencies
         run: sudo apt-get install -y jq
 
@@ -134,7 +137,7 @@ jobs:
           echo "release_name=$(echo "$DATA" | jq -r '.name // empty')" >> "$GITHUB_OUTPUT"
           echo "prerelease=$(echo "$DATA"   | jq -r '.prerelease')"     >> "$GITHUB_OUTPUT"
 
-          echo "$DATA" | jq -r '.body // ""' > /tmp/release_body.md
+          echo "$DATA" | jq -r '.body // ""' > "$GITHUB_WORKSPACE/release_body.md"
 
       - name: Download tarball, strip .git, repack
         env:
@@ -147,8 +150,8 @@ jobs:
           BASENAME="esp-idf-${TAG}"
           TARBALL_URL="https://github.com/espressif/esp-idf/archive/refs/tags/${TAG}.tar.gz"
 
-          mkdir -p /tmp/work
-          cd /tmp/work
+          mkdir -p "$GITHUB_WORKSPACE/work"
+          cd "$GITHUB_WORKSPACE/work"
 
           echo "==> Downloading ${TAG}…"
           curl -fL "$TARBALL_URL" -o upstream.tar.gz
@@ -174,7 +177,7 @@ jobs:
           ls -lh "${BASENAME}.tar.gz" "${BASENAME}.zip"
 
           echo "BASENAME=${BASENAME}" >> "$GITHUB_ENV"
-          echo "WORK_DIR=/tmp/work"   >> "$GITHUB_ENV"
+          echo "WORK_DIR=$GITHUB_WORKSPACE/work"   >> "$GITHUB_ENV"
 
       - name: Publish mirrored release
         env:
@@ -187,7 +190,7 @@ jobs:
           cd "$WORK_DIR"
 
           printf '> Mirrored from [espressif/esp-idf@%s](https://github.com/espressif/esp-idf/releases/tag/%s). `.git` directory removed.\n\n---\n\n' \
-            "$TAG" "$TAG" | cat - /tmp/release_body.md > /tmp/full_body.md
+            "$TAG" "$TAG" | cat - "$GITHUB_WORKSPACE/release_body.md" > "$GITHUB_WORKSPACE/full_body.md"
 
           # Delete existing release + tag in this repo (idempotent)
           gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
@@ -211,7 +214,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "${RELEASE_NAME:-$TAG}" \
-            --notes-file /tmp/full_body.md \
+            --notes-file "$GITHUB_WORKSPACE/full_body.md" \
             $PRERELEASE_FLAG \
             "${BASENAME}.tar.gz" \
             "${BASENAME}.zip"
