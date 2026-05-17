@@ -14,6 +14,10 @@ on:
         description: 'Backfill ALL releases, ignores release_count (true/false)'
         required: false
         default: 'false'
+      regenerate:
+        description: 'Regenerate already-mirrored releases (true/false)'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -62,21 +66,27 @@ jobs:
       - name: Fetch already-mirrored releases in this repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGENERATE: ${{ github.event.inputs.regenerate }}
         run: |
-          PAGE=1
-          MIRRORED="[]"
-          while true; do
-            CHUNK=$(gh api \
-              -H "Accept: application/vnd.github+json" \
-              "repos/${{ github.repository }}/releases?per_page=100&page=${PAGE}" \
-              --jq '[.[].tag_name]' 2>/dev/null || echo "[]")
-            COUNT=$(echo "$CHUNK" | jq 'length')
-            MIRRORED=$(jq -n --argjson a "$MIRRORED" --argjson b "$CHUNK" '$a + $b')
-            [ "$COUNT" -lt 100 ] && break
-            PAGE=$((PAGE + 1))
-          done
-          echo "Already mirrored: $(echo "$MIRRORED" | jq 'length') releases"
-          echo "$MIRRORED" > /tmp/mirrored_tags.json
+          if [ "$REGENERATE" = "true" ]; then
+            # In regenerate mode always treat all tags as not yet mirrored
+            echo "[]" > /tmp/mirrored_tags.json
+          else
+            PAGE=1
+            MIRRORED="[]"
+            while true; do
+              CHUNK=$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${{ github.repository }}/releases?per_page=100&page=${PAGE}" \
+                --jq '[.[].tag_name]' 2>/dev/null || echo "[]")
+              COUNT=$(echo "$CHUNK" | jq 'length')
+              MIRRORED=$(jq -n --argjson a "$MIRRORED" --argjson b "$CHUNK" '$a + $b')
+              [ "$COUNT" -lt 100 ] && break
+              PAGE=$((PAGE + 1))
+            done
+            echo "Already mirrored: $(echo "$MIRRORED" | jq 'length') releases"
+            echo "$MIRRORED" > /tmp/mirrored_tags.json
+          fi
 
       - name: Build job matrix
         id: build-matrix
@@ -177,16 +187,21 @@ jobs:
           find "${EXTRACTED_DIR}" -name ".gitignore"     -type f -delete 2>/dev/null || true
           find "${EXTRACTED_DIR}" -name ".gitattributes" -type f -delete 2>/dev/null || true
 
-          # Repack as .tar.xz — same base name as the original zip, just different extension
-          XZ_NAME="${ASSET_NAME%.zip}.tar.xz"
+          BASE="${ASSET_NAME%.zip}"
+
+          echo "==> Repacking as zip…"
+          zip -qr "${BASE}.zip" "${EXTRACTED_DIR}"
+
+          echo "==> Repacking as tar.gz…"
+          tar czf "${BASE}.tar.gz" "${EXTRACTED_DIR}"
 
           echo "==> Repacking as tar.xz…"
-          tar cJf "${XZ_NAME}" "${EXTRACTED_DIR}"
+          tar cJf "${BASE}.tar.xz" "${EXTRACTED_DIR}"
 
-          echo "==> Size:"
-          ls -lh "${XZ_NAME}"
+          echo "==> Sizes:"
+          ls -lh "${BASE}.zip" "${BASE}.tar.gz" "${BASE}.tar.xz"
 
-          echo "XZ_NAME=${XZ_NAME}" >> "$GITHUB_ENV"
+          echo "BASE=${BASE}" >> "$GITHUB_ENV"
           echo "WORK_DIR=$GITHUB_WORKSPACE/work" >> "$GITHUB_ENV"
 
       - name: Publish mirrored release
@@ -195,11 +210,9 @@ jobs:
           TAG: ${{ matrix.tag }}
           RELEASE_NAME: ${{ steps.meta.outputs.release_name }}
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
-          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          XZ_NAME="${ASSET_NAME%.zip}.tar.xz"
 
           printf '> Mirrored from [espressif/esp-idf@%s](https://github.com/espressif/esp-idf/releases/tag/%s). `.git` directory removed.\n\n---\n\n' \
             "$TAG" "$TAG" | cat - "$GITHUB_WORKSPACE/release_body.md" > "$GITHUB_WORKSPACE/full_body.md"
@@ -228,6 +241,8 @@ jobs:
             --title "${RELEASE_NAME:-$TAG}" \
             --notes-file "$GITHUB_WORKSPACE/full_body.md" \
             $PRERELEASE_FLAG \
-            "${XZ_NAME}"
+            "${BASE}.zip" \
+            "${BASE}.tar.gz" \
+            "${BASE}.tar.xz"
 
           echo "✅ Mirrored $TAG"
